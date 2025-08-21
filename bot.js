@@ -17,31 +17,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🔄 Health server running on port ${PORT}`);
 });
 
-// Safe message sending function
-function sendSafeMessage(chatId, message, options = {}) {
-  if (!message || message.length === 0) {
-    return bot.sendMessage(chatId, "⚠️ No response generated", options);
-  }
-  
-  // Escape special Markdown characters
-  const cleanText = message.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-  
-  // Split into chunks of 4000 characters (Telegram limit)
-  const chunks = cleanText.match(/.{1,4000}/g) || [];
-  
-  // Send each chunk
-  return Promise.all(chunks.map(chunk => {
-    return bot.sendMessage(chatId, chunk, options).catch(err => {
-      console.log('Message sending error:', err.message);
-      // Fallback: send without formatting if Markdown fails
-      if (err.message.includes('parse entities')) {
-        const plainText = chunk.replace(/\\/g, '');
-        return bot.sendMessage(chatId, plainText);
-      }
-    });
-  }));
-}
-
 // Main bot code
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
@@ -105,6 +80,79 @@ const technicalSkills = [
   'Critical Thinking', 'Adaptability', 'Creativity', 'Emotional Intelligence'
 ];
 
+// Improved intelligent message splitting
+function splitMessageIntelligently(message, maxLength = 4000) {
+  if (!message || message.length === 0) return [''];
+  if (message.length <= maxLength) return [message];
+  
+  const chunks = [];
+  let remaining = message;
+  
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+    
+    // Try to split at the last paragraph break
+    let splitIndex = remaining.lastIndexOf('\n\n', maxLength);
+    
+    // If no paragraph break, try at sentence end
+    if (splitIndex === -1) splitIndex = remaining.lastIndexOf('. ', maxLength);
+    
+    // If no sentence end, try at line break
+    if (splitIndex === -1) splitIndex = remaining.lastIndexOf('\n', maxLength);
+    
+    // If no line break, try at word boundary
+    if (splitIndex === -1) splitIndex = remaining.lastIndexOf(' ', maxLength);
+    
+    // If all else fails, split at maxLength
+    if (splitIndex === -1 || splitIndex < maxLength / 2) splitIndex = maxLength;
+    
+    chunks.push(remaining.substring(0, splitIndex).trim());
+    remaining = remaining.substring(splitIndex).trim();
+  }
+  
+  return chunks;
+}
+
+// Send chunks with delay to avoid rate limiting
+function sendChunksWithDelay(chatId, chunks, options, delay = 500) {
+  return chunks.reduce((promise, chunk, index) => {
+    return promise.then(() => {
+      return new Promise(resolve => {
+        setTimeout(() => {
+          bot.sendMessage(chatId, chunk, { 
+            ...options,
+            parse_mode: undefined // Force plain text to avoid formatting issues
+          })
+          .then(resolve)
+          .catch(error => {
+            console.log('Error sending chunk:', error.message);
+            resolve(); // Continue even if one chunk fails
+          });
+        }, index > 0 ? delay : 0);
+      });
+    });
+  }, Promise.resolve());
+}
+
+// Safe message sending function
+function sendSafeMessage(chatId, message, options = {}) {
+  if (!message || message.length === 0) {
+    return bot.sendMessage(chatId, "⚠️ No response generated", options);
+  }
+  
+  // Remove Markdown formatting for safe sending
+  const plainText = message.replace(/[*_`~#]/g, '');
+  
+  // Split into logical chunks (by paragraphs or sentences)
+  const chunks = splitMessageIntelligently(plainText);
+  
+  // Send each chunk with a small delay
+  return sendChunksWithDelay(chatId, chunks, options);
+}
+
 // Utility Functions
 function extractSkills(text) {
   const foundSkills = new Set();
@@ -121,21 +169,7 @@ function extractSkills(text) {
 }
 
 function splitMessage(message, maxLength = 4096) {
-  const messages = [];
-  if (!message) return [''];
-  
-  while (message.length > maxLength) {
-    let splitPoint = message.lastIndexOf('\n', maxLength);
-    if (splitPoint === -1) splitPoint = message.lastIndexOf('. ', maxLength);
-    if (splitPoint === -1) splitPoint = message.lastIndexOf(' ', maxLength);
-    if (splitPoint === -1) splitPoint = maxLength;
-    
-    messages.push(message.slice(0, splitPoint));
-    message = message.slice(splitPoint).trimStart();
-  }
-  
-  messages.push(message);
-  return messages;
+  return splitMessageIntelligently(message, maxLength);
 }
 
 async function generateAIContent(prompt) {
@@ -184,6 +218,7 @@ function calculateATSSCore(text) {
     .slice(0, 5)
     .join(', ');
   
+  // Return as a single string to be sent in one message
   return `📊 Your ATS Score: ${score}/100\n\n🔍 To improve, consider adding:\n${suggestedKeywords || "More relevant keywords for your target role"}`;
 }
 
@@ -192,20 +227,25 @@ bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   userStates.delete(chatId);
 
-  const welcomeMessage = `🌟 *Welcome to Resume Assistant Bot* 🌟\n\nI can help you with:\n• Resume optimization\n• Interview preparation\n• ATS score checking\n• Mock interviews`;
+  const welcomeMessage = `🌟 Welcome to Resume Assistant Bot 🌟
+
+I can help you with:
+• Resume optimization
+• Interview preparation
+• ATS score checking
+• Mock interviews`;
 
   const options = {
     reply_markup: {
       inline_keyboard: [
         [{ text: '📝 Upload Resume', callback_data: 'upload_resume' }],
         [{ text: '📊 Check ATS Score', callback_data: 'ats_score' }],
-        [{ text: '❓ Generate Interview Questions', callback_data: 'generate_questions' }],
+        [{ text: '❓ Generate Questions', callback_data: 'generate_questions' }],
         [{ text: '🎤 Start Mock Interview', callback_data: 'mock_interview' }],
         [{ text: '🛠️ Resume Analysis', callback_data: 'analyze_resume' }],
         [{ text: 'ℹ️ Help', callback_data: 'help' }]
       ],
-    },
-    parse_mode: 'Markdown'
+    }
   };
 
   sendSafeMessage(chatId, welcomeMessage, options);
@@ -279,8 +319,7 @@ bot.on('callback_query', async (query) => {
 
 // Feature Functions
 async function startMockInterview(chatId) {
-  sendSafeMessage(chatId, '🎤 *Starting Mock Interview*\n\nI will ask you questions one by one. Reply to each question.\nType /end_interview to stop.', 
-    { parse_mode: 'Markdown' });
+  sendSafeMessage(chatId, '🎤 Starting Mock Interview\n\nI will ask you questions one by one. Reply to each question.\nType /end_interview to stop.');
   
   userStates.set(chatId, { 
     state: 'MOCK_INTERVIEW', 
@@ -310,7 +349,7 @@ async function generateGeneralQuestions(chatId) {
   const prompt = `Generate 10 comprehensive general interview questions for software engineers covering:\n- Technical concepts\n- Problem-solving\n- Teamwork\n- Career goals\n\nFormat as a numbered list with clear questions.`;
   
   const questions = await generateAIContent(prompt);
-  sendSafeMessage(chatId, '📝 *General Interview Questions*\n\n' + questions);
+  sendSafeMessage(chatId, '📝 General Interview Questions\n\n' + questions);
 }
 
 async function generateTechnicalQuestions(chatId) {
@@ -319,7 +358,7 @@ async function generateTechnicalQuestions(chatId) {
   const prompt = `Generate 10 challenging technical interview questions covering:\n- Data structures & algorithms\n- System design\n- Language-specific concepts\n- Debugging scenarios\n\nFormat as a numbered list.`;
   
   const questions = await generateAIContent(prompt);
-  sendSafeMessage(chatId, '💻 *Technical Interview Questions*\n\n' + questions);
+  sendSafeMessage(chatId, '💻 Technical Interview Questions\n\n' + questions);
 }
 
 async function generateBehavioralQuestions(chatId) {
@@ -328,26 +367,26 @@ async function generateBehavioralQuestions(chatId) {
   const prompt = `Generate 10 behavioral interview questions focusing on:\n- Team conflicts\n- Leadership\n- Failure experiences\n- Time management\n- Work ethics\n\nFormat as a numbered list.`;
   
   const questions = await generateAIContent(prompt);
-  sendSafeMessage(chatId, '🤝 *Behavioral Interview Questions*\n\n' + questions);
+  sendSafeMessage(chatId, '🤝 Behavioral Interview Questions\n\n' + questions);
 }
 
 function showHelp(chatId) {
-  const helpMessage = `🆘 *Help Guide* 🆘
+  const helpMessage = `🆘 Help Guide 🆘
 
-📝 *Upload Resume* - Analyze and optimize your resume PDF
-📊 *ATS Score* - Check how well your resume passes automated systems
-❓ *Interview Questions* - Get tailored questions for practice
-🎤 *Mock Interview* - Practice with simulated interview
-🛠️ *Resume Analysis* - Get detailed feedback on your resume
+📝 Upload Resume - Analyze and optimize your resume PDF
+📊 ATS Score - Check how well your resume passes automated systems
+❓ Interview Questions - Get tailored questions for practice
+🎤 Mock Interview - Practice with simulated interview
+🛠️ Resume Analysis - Get detailed feedback on your resume
 
-*Commands:*
+Commands:
 /start - Show main menu
 /end_interview - Stop mock interview
 /help - Show this message
 
 🔍 For best results, upload your resume first to get personalized suggestions.`;
 
-  sendSafeMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
+  sendSafeMessage(chatId, helpMessage);
 }
 
 // Document Handler
@@ -400,19 +439,14 @@ bot.on('document', async (msg) => {
           [{ text: '🔍 Analyze Content', callback_data: 'action_content_analysis' }],
           [{ text: '💼 Optimize for Role', callback_data: 'action_optimize_role' }]
         ]
-      },
-      parse_mode: 'Markdown'
+      }
     };
 
-    if (extractedSkills.length > 0) {
-      sendSafeMessage(chatId, 
-        `✅ Resume processed successfully!\n\n🔧 Skills detected:\n${extractedSkills.join(', ')}\n\nWhat would you like to do?`, 
-        options);
-    } else {
-      sendSafeMessage(chatId, 
-        '✅ Resume processed, but no specific skills detected. Consider adding more keywords.', 
-        options);
-    }
+    const skillsMessage = extractedSkills.length > 0 
+      ? `✅ Resume processed successfully!\n\n🔧 Skills detected:\n${extractedSkills.join(', ')}\n\nWhat would you like to do?`
+      : '✅ Resume processed, but no specific skills detected. Consider adding more keywords.\n\nWhat would you like to do?';
+
+    sendSafeMessage(chatId, skillsMessage, options);
   } catch (error) {
     console.error('PDF Processing Error:', error);
     sendSafeMessage(chatId, '⚠️ Error processing your resume. Please ensure it\'s a valid PDF and try again.');
@@ -450,7 +484,7 @@ async function handleResumeActions(chatId, action, query) {
       - 1 situational question\n\nFormat as a numbered list.`;
       
       const questions = await generateAIContent(prompt);
-      sendSafeMessage(chatId, '🎯 *Tailored Interview Questions*\n\n' + questions);
+      sendSafeMessage(chatId, '🎯 Tailored Interview Questions\n\n' + questions);
       break;
       
     case 'action_content_analysis':
@@ -463,13 +497,12 @@ async function handleResumeActions(chatId, action, query) {
       5. Keyword optimization\n\nBe constructive and specific.`;
       
       const analysis = await generateAIContent(analysisPrompt);
-      sendSafeMessage(chatId, '📝 *Resume Analysis Report*\n\n' + analysis);
+      sendSafeMessage(chatId, '📝 Resume Analysis Report\n\n' + analysis);
       break;
       
     case 'action_optimize_role':
       userStates.set(chatId, { ...userState, state: 'WAITING_FOR_JOB_TITLE' });
-      sendSafeMessage(chatId, '💼 Please reply with the *exact job title* you\'re targeting (e.g., "Senior Frontend Developer"):', 
-        { parse_mode: 'Markdown' });
+      sendSafeMessage(chatId, '💼 Please reply with the exact job title you\'re targeting (e.g., "Senior Frontend Developer"):');
       break;
   }
 }
@@ -504,7 +537,7 @@ async function handleJobTitleInput(chatId, jobTitle, userState) {
   4. Any role-specific formatting tips\n\nBe specific and actionable.`;
   
   const optimization = await generateAIContent(prompt);
-  sendSafeMessage(chatId, `💼 *Optimization for ${jobTitle}*\n\n${optimization}`);
+  sendSafeMessage(chatId, `💼 Optimization for ${jobTitle}\n\n${optimization}`);
   userStates.delete(chatId);
 }
 
@@ -521,7 +554,7 @@ async function handleMockInterviewResponse(chatId, answer, userState) {
   const feedbackPrompt = `Question: ${questions[currentQuestionIndex]}\nAnswer: ${answer}\n\nProvide brief constructive feedback focusing on:\n- Technical accuracy\n- Clarity\n- Completeness\n- Improvement suggestions\n\nKeep it under 100 words.`;
   const feedback = await generateAIContent(feedbackPrompt);
   
-  await sendSafeMessage(chatId, `💡 *Feedback*:\n${feedback}`, { parse_mode: 'Markdown' });
+  await sendSafeMessage(chatId, `💡 Feedback:\n${feedback}`);
   
   // Move to next question or end
   const nextIndex = currentQuestionIndex + 1;
@@ -539,8 +572,7 @@ async function handleMockInterviewResponse(chatId, answer, userState) {
 function endMockInterview(chatId) {
   const userState = userStates.get(chatId);
   if (userState?.state === 'MOCK_INTERVIEW') {
-    sendSafeMessage(chatId, '🎉 *Mock Interview Completed!*\n\nReview your answers and feedback. Practice makes perfect!\n\nType /start to explore other features.', 
-      { parse_mode: 'Markdown' });
+    sendSafeMessage(chatId, '🎉 Mock Interview Completed!\n\nReview your answers and feedback. Practice makes perfect!\n\nType /start to explore other features.');
     userStates.delete(chatId);
   } else {
     sendSafeMessage(chatId, '⚠️ No active mock interview to end.');
